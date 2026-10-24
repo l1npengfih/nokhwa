@@ -48,9 +48,7 @@ pub mod wmf {
         time::Duration,
     };
     use windows::Win32::Media::DirectShow::{CameraControl_Flags_Auto, CameraControl_Flags_Manual};
-    use windows::Win32::Media::MediaFoundation::{
-        MFCreateSample, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-    };
+    use windows::Win32::Media::MediaFoundation::MF_SOURCE_READER_FIRST_VIDEO_STREAM;
     use windows::{
         core::{Interface, GUID, PWSTR},
         Win32::{
@@ -1139,12 +1137,9 @@ pub mod wmf {
         }
 
         pub fn raw_bytes(&mut self) -> Result<(Cow<'_, [u8]>, Option<Duration>), NokhwaError> {
-            let mut imf_sample: Option<IMFSample> = match unsafe { MFCreateSample() } {
-                Ok(sample) => Some(sample),
-                Err(why) => {
-                    return Err(NokhwaError::ReadFrameError(why.to_string()));
-                }
-            };
+            // ReadSample's ppSample is an [out] parameter: it overwrites the slot without releasing
+            // what is already there, so a sample created here beforehand leaked once per frame.
+            let mut imf_sample: Option<IMFSample> = None;
             let mut stream_flags = 0;
             let mut sample_time_100ns: i64 = 0;
             {
