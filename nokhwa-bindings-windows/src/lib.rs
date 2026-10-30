@@ -40,7 +40,6 @@ pub mod wmf {
         borrow::Cow,
         cell::Cell,
         mem::MaybeUninit,
-        slice::from_raw_parts,
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
@@ -75,7 +74,7 @@ pub mod wmf {
                     MF_MT_SUBTYPE, MF_READWRITE_DISABLE_CONVERTERS,
                 },
             },
-            System::Com::{CoInitializeEx, CoUninitialize, COINIT},
+            System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT},
         },
     };
 
@@ -252,83 +251,107 @@ pub mod wmf {
         };
 
         let mut count: u32 = 0;
-        let mut unused_mf_activate: MaybeUninit<*mut Option<IMFActivate>> = MaybeUninit::uninit();
+        let mut array: *mut Option<IMFActivate> = std::ptr::null_mut();
 
-        if let Err(why) =
-            unsafe { MFEnumDeviceSources(&attributes, unused_mf_activate.as_mut_ptr(), &mut count) }
-        {
+        // SAFETY: `attributes` is a live IMFAttributes, and `array` and `count`
+        // are valid out-pointers. On success MFEnumDeviceSources writes a CoTaskMemAlloc'd array
+        // of `count` owned references (or a null array when there are none); it is consumed and
+        // freed below.
+        if let Err(why) = unsafe { MFEnumDeviceSources(&attributes, &mut array, &mut count) } {
             return Err(NokhwaError::StructureError {
                 structure: "MFEnumDeviceSources".to_string(),
                 error: why.to_string(),
             });
         }
 
-        let mut device_list = vec![];
-        if count == 0 {
-            return Ok(device_list);
+        // MFEnumDeviceSources hands over a CoTaskMemAlloc'd array that holds one
+        // reference per device. Cloning each element (an AddRef) without releasing
+        // the array's own references or freeing the array meant every query leaked one IMFActivate
+        // per listed device, and the activate that was opened kept its media source alive. Move
+        // each reference out of the array instead, then free the array.
+        let mut device_list = Vec::with_capacity(count as usize);
+        if !array.is_null() {
+            for i in 0..count as usize {
+                // SAFETY: `array` is non-null and holds `count` initialised
+                // `Option<IMFActivate>` slots (a COM pointer or null), and `i < count`. Each slot
+                // is read exactly once and never dropped in place (the array is freed below
+                // without touching its elements), so every reference is released exactly once,
+                // by `device_list`. No early return inside this loop skips the free.
+                if let Some(imf_activate) = unsafe { std::ptr::read(array.add(i)) } {
+                    device_list.push(imf_activate);
+                }
+            }
+            // SAFETY: `array` is non-null, was allocated by Media Foundation with
+            // CoTaskMemAlloc, every element has been moved out above, and it is freed once.
+            unsafe { CoTaskMemFree(Some(array as *const c_void)) };
         }
 
-        unsafe { from_raw_parts(unused_mf_activate.assume_init(), count as usize) }
-            .iter()
-            .for_each(|pointer| {
-                if let Some(imf_activate) = pointer {
-                    device_list.push(imf_activate.clone());
-                }
-            });
-
         Ok(device_list)
+    }
+
+    /// A string from `IMFActivate::GetAllocatedString`, freed with
+    /// `CoTaskMemFree` when dropped. Without it, two strings leaked per device per query.
+    struct CoTaskString(PWSTR);
+
+    impl Drop for CoTaskString {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: the pointer is non-null and was allocated by
+                // GetAllocatedString with CoTaskMemAlloc; this guard owns it and frees it once.
+                unsafe { CoTaskMemFree(Some(self.0 .0 as *const c_void)) };
+            }
+        }
+    }
+
+    /// Reads one string attribute of `imf_activate`.
+    fn allocated_string(
+        imf_activate: &IMFActivate,
+        key: &GUID,
+        property: &str,
+    ) -> Result<CoTaskString, NokhwaError> {
+        let mut pwstr = PWSTR::null();
+        let mut len = 0;
+        // SAFETY: `imf_activate` is a live IMFActivate and `pwstr` and `len` are
+        // valid out-pointers. On success the string belongs to the caller, and the guard made
+        // just below frees it.
+        if let Err(why) = unsafe { imf_activate.GetAllocatedString(key, &mut pwstr, &mut len) } {
+            return Err(NokhwaError::GetPropertyError {
+                property: property.to_string(),
+                error: why.to_string(),
+            });
+        }
+        let string = CoTaskString(pwstr);
+        if string.0.is_null() {
+            return Err(NokhwaError::GetPropertyError {
+                property: property.to_string(),
+                error: "Call to IMFActivate::GetAllocatedString failed - PWSTR is null".to_string(),
+            });
+        }
+        Ok(string)
     }
 
     fn activate_to_descriptors(
         index: CameraIndex,
         imf_activate: &IMFActivate,
     ) -> Result<CameraInfo, NokhwaError> {
-        let mut pwstr_name = PWSTR(&mut 0_u16);
-        let mut len_pwstrname = 0;
-        let mut pwstr_symlink = PWSTR(&mut 0_u16);
-        let mut len_pwstrsymlink = 0;
+        // Both strings are freed when they go out of scope, on the error paths too.
+        let pwstr_name = allocated_string(
+            imf_activate,
+            &MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
+            "MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME",
+        )?;
+        let pwstr_symlink = allocated_string(
+            imf_activate,
+            &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
+            "MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK",
+        )?;
 
-        if let Err(why) = unsafe {
-            imf_activate.GetAllocatedString(
-                &MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
-                &mut pwstr_name,
-                &mut len_pwstrname,
-            )
-        } {
-            return Err(NokhwaError::GetPropertyError {
-                property: "MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME".to_string(),
-                error: why.to_string(),
-            });
-        }
-
-        if let Err(why) = unsafe {
-            imf_activate.GetAllocatedString(
-                &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
-                &mut pwstr_symlink,
-                &mut len_pwstrsymlink,
-            )
-        } {
-            return Err(NokhwaError::GetPropertyError {
-                property: "MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK".to_string(),
-                error: why.to_string(),
-            });
-        }
-
-        if pwstr_name.is_null() {
-            return Err(NokhwaError::GetPropertyError {
-                property: "MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME".to_string(),
-                error: "Call to IMFActivate::GetAllocatedString failed - PWSTR is null".to_string(),
-            });
-        }
-        if pwstr_symlink.is_null() {
-            return Err(NokhwaError::GetPropertyError {
-                property: "MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK".to_string(),
-                error: "Call to IMFActivate::GetAllocatedString failed - PWSTR is null".to_string(),
-            });
-        }
-
+        // SAFETY (the `.0` only): both strings are non-null, NUL-terminated UTF-16
+        // from GetAllocatedString, and their guards keep them alive until the end of this
+        // function, past these reads.
         let name = unsafe {
             pwstr_name
+                .0
                 .to_string()
                 .map_err(|x| NokhwaError::StructureError {
                     structure: "PWSTR/String - Name".to_string(),
@@ -337,6 +360,7 @@ pub mod wmf {
         };
         let symlink = unsafe {
             pwstr_symlink
+                .0
                 .to_string()
                 .map_err(|x| NokhwaError::StructureError {
                     structure: "PWSTR/String - Symlink".to_string(),
