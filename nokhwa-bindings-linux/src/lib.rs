@@ -38,6 +38,7 @@ mod internal {
         V4L2_CID_TILT_RELATIVE, V4L2_CID_WHITE_BALANCE_TEMPERATURE, V4L2_CID_ZOOM_RELATIVE,
     };
     use v4l::{
+        buffer::{Flags as BufferFlags, Metadata},
         control::{Control, Flags, Type, Value},
         frameinterval::FrameIntervalEnum,
         framesize::FrameSizeEnum,
@@ -880,6 +881,7 @@ mod internal {
             match &mut self.stream_handle {
                 Some(sh) => match sh.next() {
                     Ok((data, meta)) => {
+                        check_undamaged(meta)?;
                         let wall_ts = monotonic_to_wallclock(meta.timestamp);
                         Ok(Buffer::with_timestamp(
                             cam_fmt.resolution(),
@@ -899,7 +901,10 @@ mod internal {
         fn frame_raw(&mut self) -> Result<Cow<'_, [u8]>, NokhwaError> {
             match &mut self.stream_handle {
                 Some(sh) => match sh.next() {
-                    Ok((data, _)) => Ok(Cow::Borrowed(data)),
+                    Ok((data, meta)) => {
+                        check_undamaged(meta)?;
+                        Ok(Cow::Borrowed(data))
+                    }
                     Err(why) => Err(NokhwaError::ReadFrameError(why.to_string())),
                 },
                 None => Err(NokhwaError::ReadFrameError(
@@ -939,6 +944,15 @@ mod internal {
         }
     }
 
+    /// The driver flags a buffer it filled only in part or with corrupt data (uvcvideo does on a
+    /// USB transfer error), even when `bytesused` is the full frame size.
+    fn check_undamaged(meta: &Metadata) -> Result<(), NokhwaError> {
+        if meta.flags.contains(BufferFlags::ERROR) {
+            return Err(NokhwaError::ReadFrameError("Frame Damaged".to_string()));
+        }
+        Ok(())
+    }
+
     /// Convert a V4L2 CLOCK_MONOTONIC timestamp to a wallclock Duration since UNIX_EPOCH.
     fn monotonic_to_wallclock(ts: v4l::Timestamp) -> Option<std::time::Duration> {
         let frame_mono = std::time::Duration::from(ts);
@@ -959,14 +973,44 @@ mod internal {
             libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut mono_now);
             libc::clock_gettime(libc::CLOCK_REALTIME, &mut wall_now);
         }
-        let mono_now =
-            std::time::Duration::new(mono_now.tv_sec as u64, mono_now.tv_nsec as u32);
-        let wall_now =
-            std::time::Duration::new(wall_now.tv_sec as u64, wall_now.tv_nsec as u32);
+        let mono_now = std::time::Duration::new(mono_now.tv_sec as u64, mono_now.tv_nsec as u32);
+        let wall_now = std::time::Duration::new(wall_now.tv_sec as u64, wall_now.tv_nsec as u32);
 
         // frame_age = how long ago the frame was captured (monotonic delta)
         let frame_age = mono_now.checked_sub(frame_mono)?;
         wall_now.checked_sub(frame_age)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn meta(flags: BufferFlags) -> Metadata {
+            Metadata {
+                bytesused: 640 * 480 * 2,
+                flags,
+                ..Metadata::default()
+            }
+        }
+
+        #[test]
+        fn a_full_size_buffer_flagged_error_is_damaged() {
+            assert!(matches!(
+                check_undamaged(&meta(
+                    BufferFlags::MAPPED | BufferFlags::DONE | BufferFlags::ERROR
+                )),
+                Err(NokhwaError::ReadFrameError(_))
+            ));
+        }
+
+        #[test]
+        fn other_flags_are_not_damage() {
+            assert!(check_undamaged(&meta(BufferFlags::empty())).is_ok());
+            assert!(check_undamaged(&meta(
+                BufferFlags::MAPPED | BufferFlags::DONE | BufferFlags::KEYFRAME
+            ))
+            .is_ok());
+        }
     }
 }
 
